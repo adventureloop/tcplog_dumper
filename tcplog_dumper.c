@@ -120,6 +120,7 @@ static pthread_mutex_t log_record_mutex;
 static pthread_mutex_t queuewait_mutex;
 static pthread_cond_t queuewait_cond;
 
+static bool sFlag;	/* Are we extracting for a static dump file? */
 
 static void
 log_message(int priority, const char *message, ...) __printflike(2, 3);
@@ -1642,7 +1643,7 @@ open_bbr_file(int dirfd, struct tcp_log_header *hdr, char *out_file,
 	}
 	if (fd < 0)
 		warn("Unable to open file to write black box record");
-	else {
+	else if (!sFlag) {
 		*file_no = i;
 
 		/*
@@ -1703,7 +1704,6 @@ restart:
 		unlinkat(dirfd, out_file, 0);
 		return;
 	}
-
 	/* Iterate through the records. */
 	conn_end = false;
 	first_record = true;
@@ -2052,8 +2052,8 @@ do_loop(int dirfd, int fd)
 			lh = (struct tcp_log_header *)inbuf;
 			if (reason_must_be &&
 			    (strncasecmp(lh->tlh_reason, reason_must_be, reason_len) != 0)) {
-				/* 
-				 * The reason does not match our required reason 
+				/*
+				 * The reason does not match our required reason
 				 * skip this record.
 				 */
 				log_message(LOG_INFO, "Skipping record of non matching reason"
@@ -2099,7 +2099,7 @@ do_loop(int dirfd, int fd)
 static void usage(char *prog) __attribute__ ((noreturn));
 static void usage(char *prog)
 {
-	fprintf(stderr, "%s [-dhJ] [-D dir] [-f file] [-u user] [-r reason]\n", prog);
+	fprintf(stderr, "%s [-dhJs] [-D dir] [-f file] [-u user] [-r reason]\n", prog);
 	fprintf(stderr, "\n"
 	    "  -d: Daemonize the process.\n"
 	    "  -h: Display this help message.\n"
@@ -2108,6 +2108,7 @@ static void usage(char *prog)
 	    "  -f: Read from the given file. (Default: %s)\n"
 	    "  -u: Use the UID of the given username. (Default: %s)\n"
 	    "  -r reason: only write records of type reason\n"
+	    "  -s static file: extract logs from a static file\n"
 	    "\n", default_directory, default_filename, default_username);
 
 	exit(1);
@@ -2186,6 +2187,89 @@ save_pid(int fd)
 	fclose(pid_file);
 }
 
+static struct tcp_log_header *
+read_hdr(int fd)
+{
+	struct tcp_log_common_header hdr;
+	struct tcp_log_header *lh = NULL;
+	void *curp, *inbuf;
+	ssize_t bytes_need, bytes_read;
+	int alignment;
+
+	/*
+	 * Determine the lowest alignment requirement that will satisfy all
+	 * the data structures. (At the moment, that is easy, since there
+	 * is only one.)
+	 */
+	alignment = __alignof__(struct tcp_log_header);
+
+	bytes_read = refill_input(fd, &hdr, sizeof(hdr), sizeof(hdr));
+	/* Check for EOF. */
+	if (bytes_read == 0)
+		do_exit(0);
+	/* Check for a read error. */
+	if (bytes_read < 0)
+		do_err(1, "Error reading input");
+	/* Check for a short read. */
+	if (bytes_read < (ssize_t)sizeof(hdr)) {
+		fprintf(stderr, "Error reading log header: "
+		    "received %zu bytes, expected %zu bytes\n",
+		    bytes_read, sizeof(hdr));
+		do_exit(1);
+	}
+
+	/* Allocate a buffer and read the message. */
+	inbuf = aligned_alloc(alignment,
+	    roundup2(hdr.tlch_length, alignment));
+	if (inbuf == NULL)
+		do_err(1, "Error allocating buffer for log message");
+	memcpy(inbuf, &hdr, sizeof(hdr));
+	curp = ((uint8_t *)inbuf) + sizeof(hdr);
+
+	bytes_need = hdr.tlch_length - sizeof(hdr);
+	assert(bytes_need >= 0);
+	if (bytes_need > 0) {
+		bytes_read = refill_input(fd, curp, bytes_need,
+		    bytes_need);
+
+		/* Check for various read problems. */
+		if (bytes_read < 0)
+			do_err(1, "Error reading input");
+		if (bytes_read < bytes_need) {
+			fprintf(stderr, "Error reading log message: "
+			    "received %zu bytes, expected %zu bytes\n",
+			    bytes_read, bytes_need);
+			do_exit(1);
+		}
+	}
+
+	switch (hdr.tlch_type) {
+	case TCP_LOG_DEV_TYPE_BBR:
+		/* Add this to the queue for the thread pool. */
+		lh = (struct tcp_log_header *)inbuf;
+		if (reason_must_be &&
+		    (strncasecmp(lh->tlh_reason, reason_must_be, reason_len) != 0)) {
+			/*
+			 * The reason does not match our required reason
+			 * skip this record.
+			 */
+			log_message(LOG_INFO, "Skipping record of non matching reason"
+				    "%s", lh->tlh_reason);
+
+			free(inbuf);
+			break;
+		}
+		break;
+
+	default:
+		log_message(LOG_INFO, "Skipping record of unknown type "
+		    "%u", hdr.tlch_type);
+		free(inbuf);
+		break;
+	}
+	return lh;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -2203,7 +2287,7 @@ main(int argc, char *argv[])
 	filename = default_filename;
 	pid_filename = NULL;
 	username = default_username;
-	while ((opt = getopt(argc, argv, ":D:df:hJp:u:r:")) != -1)
+	while ((opt = getopt(argc, argv, ":D:df:hJp:u:r:s")) != -1)
 		switch (opt) {
 		case 'r':
 			reason_must_be = optarg;
@@ -2231,6 +2315,9 @@ main(int argc, char *argv[])
 		case 'p':
 			pid_filename = optarg;
 			break;
+		case 's':
+			sFlag = true;
+			break;
 
 		case 'u':
 			username = optarg;
@@ -2245,6 +2332,11 @@ main(int argc, char *argv[])
 			fprintf(stderr, "Unknown option -%c.\n", (char)optopt);
 			usage(*argv);
 		}
+
+	if (sFlag && filename == default_filename) {
+		err(1, "s flag requires a static file log to read");
+		return (1);
+	}
 
 	/* Open the input file and PID file and then drop privileges. */
 	if ((fd = open(filename, O_RDONLY)) < 0)
@@ -2278,6 +2370,14 @@ main(int argc, char *argv[])
 		    "permission to write to directory %s.\n", username,
 		    directory);
 		return (1);
+	}
+
+	if (sFlag) {
+		struct tcp_log_header *hdr;
+
+		hdr = read_hdr(fd);
+		do_bbr_record(dirfd, hdr);
+		return (0);
 	}
 
 	/* Initialize our padding space. */

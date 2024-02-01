@@ -32,7 +32,7 @@
 .Nd Gather the data from the tcp logs.
 .Sh SYNOPSIS
 .Nm
-.Op Fl dhJ
+.Op Fl dhJs
 .Op Fl D Ar output-directory
 .Op Fl f Ar input-file
 .Op Fl p Ar pid-file
@@ -67,6 +67,10 @@ Compress the output using the XZ format.
 .It Fl p
 Write the PID to
 .Va pid-file .
+.It Fl s
+Extract statically dumped tcp log entries from a file rather than the device
+node,
+such as those manually extracted from a kernel coredump.
 .It Fl u
 After opening the input file, set the UID and GID to those of
 .Va username .
