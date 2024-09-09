@@ -97,6 +97,7 @@ static const char default_filename[] = "/dev/tcp_log";
 static const char default_username[] = "nobody";
 
 static bool do_syslog = false;
+static bool translate_stacknames = true;
 static volatile bool quit_requested = false;
 static bool reset_log_file = false;
 static int exit_code = 0;
@@ -168,6 +169,9 @@ static void
 signal_all_threads(void)
 {
 	int i;
+
+	if (bbr_threads == 0)
+		return;
 
 	for (i = 0; i < bbr_threads; i++) {
 		pthread_mutex_lock(&bbr_queue_mtx[i]);
@@ -412,6 +416,8 @@ refresh_stack_names(void)
 	size_t len;
 	int rv;
 
+	assert(translate_stacknames);
+
 	/* Get the new mappings. */
 	len = 0;
 	rv = sysctlbyname("net.inet.tcp.function_info", NULL, &len, NULL, 0);
@@ -462,7 +468,8 @@ init_stack_names(void)
 	pthread_rwlock_init(&stacknames_lock, NULL);
 	pthread_rwlock_wrlock(&stacknames_lock);
 	memset(stacknames, 0, sizeof(stacknames));
-	refresh_stack_names();
+	if (translate_stacknames)
+		refresh_stack_names();
 	pthread_rwlock_unlock(&stacknames_lock);
 }
 
@@ -745,13 +752,15 @@ pcap_stackname_opt(uint8_t *stackid, struct iovec *iov, int *iovcnt,
 	 * the stack names.
 	 */
 	if (stackname == NULL) {
-		pthread_rwlock_unlock(&stacknames_lock);
-		pthread_rwlock_wrlock(&stacknames_lock);
-		refresh_stack_names();
-		pthread_rwlock_unlock(&stacknames_lock);
-		pthread_rwlock_rdlock(&stacknames_lock);
-		stackname = stacknames[*stackid].s_stackname;
-		stacknamelen = stacknames[*stackid].s_strlen;
+		if (translate_stacknames) {
+			pthread_rwlock_unlock(&stacknames_lock);
+			pthread_rwlock_wrlock(&stacknames_lock);
+			refresh_stack_names();
+			pthread_rwlock_unlock(&stacknames_lock);
+			pthread_rwlock_rdlock(&stacknames_lock);
+			stackname = stacknames[*stackid].s_stackname;
+			stacknamelen = stacknames[*stackid].s_strlen;
+		}
 
 		/*
 		 * If we still don't have the stack name, just call it
@@ -763,7 +772,6 @@ pcap_stackname_opt(uint8_t *stackid, struct iovec *iov, int *iovcnt,
 		}
 	}
 
-	stacknamelen = strlen(stackname);
 	opt = pcap_nflx_opt_alloc(NFLX_OPT_STACKNAME, stacknamelen + 1, false);
 	if (opt == NULL)
 		return (0);
@@ -2063,8 +2071,14 @@ do_loop(int dirfd, int fd)
 				added_record = false;
 				break;
 			}
-			dispatch_bbr_record(inbuf, dirfd);
-			added_record = true;
+			if (bbr_threads > 0) {
+				dispatch_bbr_record(inbuf, dirfd);
+				added_record = true;
+			} else {
+				do_bbr_record(dirfd, inbuf);
+				added_record = false;
+				free(inbuf);
+			}
 			break;
 
 		default:
@@ -2193,7 +2207,7 @@ main(int argc, char *argv[])
 	const char *directory, *filename, *pid_filename, *username;
 	pid_t child;
 	int dirfd, fd, opt, pidfd;
-	bool daemonize;
+	bool daemonize, offline;
 
 	version_check();
 	setup_signal_handlers();
@@ -2201,9 +2215,10 @@ main(int argc, char *argv[])
 	daemonize = false;
 	directory = default_directory;
 	filename = default_filename;
+	offline = false;
 	pid_filename = NULL;
 	username = default_username;
-	while ((opt = getopt(argc, argv, ":D:df:hJp:u:r:")) != -1)
+	while ((opt = getopt(argc, argv, ":D:df:hJp:u:r:o")) != -1)
 		switch (opt) {
 		case 'r':
 			reason_must_be = optarg;
@@ -2230,6 +2245,11 @@ main(int argc, char *argv[])
 
 		case 'p':
 			pid_filename = optarg;
+			break;
+
+		case 'o':
+			offline = true;
+			translate_stacknames = false;
 			break;
 
 		case 'u':
@@ -2284,7 +2304,8 @@ main(int argc, char *argv[])
 	memset(junk, 0, MAX_SNAPLEN);
 
 	/* Initialize the stack names. */
-	init_stack_names();
+	if (!offline)
+		init_stack_names();
 
 	/* Become a daemon if requested. */
 	if (daemonize) {
@@ -2300,7 +2321,8 @@ main(int argc, char *argv[])
 	save_pid(pidfd);
 
 	/* Start threads. */
-	start_threads();
+	if (!offline)
+		start_threads();
 
 	/* Do loop. */
 	do_loop(dirfd, fd);
