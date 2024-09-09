@@ -2120,6 +2120,7 @@ static void usage(char *prog)
 	    "  -J: Compress the output using the XZ format.\n"
 	    "  -D: Store the files in the given base directory. (Default: %s)\n"
 	    "  -f: Read from the given file. (Default: %s)\n"
+	    "  -o: Offline mode (required for use with dump logs)\n"
 	    "  -u: Use the UID of the given username. (Default: %s)\n"
 	    "  -r reason: only write records of type reason\n"
 	    "\n", default_directory, default_filename, default_username);
@@ -2323,6 +2324,8 @@ main(int argc, char *argv[])
 	/* Start threads. */
 	if (!offline)
 		start_threads();
+	else
+		idcache_init(0);
 
 	/* Do loop. */
 	do_loop(dirfd, fd);
